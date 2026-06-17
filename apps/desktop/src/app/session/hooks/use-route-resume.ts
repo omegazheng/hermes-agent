@@ -1,6 +1,7 @@
 import { type MutableRefObject, useEffect, useRef } from 'react'
 
 import { isNewChatRoute } from '@/app/routes'
+import { setResumeExhaustedSessionId } from '@/store/session'
 
 interface RouteResumeOptions {
   activeSessionId: string | null
@@ -185,10 +186,15 @@ export function useRouteResume({
 
     if (!stranded) {
       // Route moved off the stranded session (or it recovered) — reset the
-      // counter so a future failure on another session starts fresh.
+      // counter so a future failure on another session starts fresh, and clear
+      // any exhausted-latch armed for a session we're no longer viewing (never
+      // the current route: that's the error state we want to keep showing).
+      // resumeSession also clears it on a fresh attempt; this covers a plain
+      // route-change away from the stranded window.
       if (retrySessionIdRef.current !== routedSessionId) {
         retrySessionIdRef.current = null
         retryAttemptRef.current = 0
+        setResumeExhaustedSessionId(current => (current && current !== routedSessionId ? null : current))
       }
 
       return
@@ -203,6 +209,11 @@ export function useRouteResume({
     if (retryAttemptRef.current >= MAX_RESUME_RETRIES) {
       // Give up auto-retrying a persistently dead backend; the user can still
       // reconnect / reselect (which resets the counter via the branch above).
+      // Surface an explicit error + manual Retry in the chat view instead of
+      // spinning the loader forever — resumeSession (manual Retry / reconnect /
+      // reselect) clears this latch and resets the counter for a fresh cycle.
+      setResumeExhaustedSessionId(routedSessionId)
+
       return
     }
 

@@ -2,6 +2,8 @@ import { cleanup, render } from '@testing-library/react'
 import type { MutableRefObject } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { $resumeExhaustedSessionId, setResumeExhaustedSessionId } from '@/store/session'
+
 import { useRouteResume } from './use-route-resume'
 
 interface HarnessProps {
@@ -263,6 +265,7 @@ describe('useRouteResume bounded auto-retry after a failed resume', () => {
     cleanup()
     vi.useRealTimers()
     vi.restoreAllMocks()
+    setResumeExhaustedSessionId(null)
   })
 
   // Common stranded-window props: gateway open, route on the session, no runtime
@@ -354,5 +357,55 @@ describe('useRouteResume bounded auto-retry after a failed resume', () => {
     // Capped at MAX_RESUME_RETRIES (4): a persistently dead backend can't
     // hot-loop the resume forever.
     expect(resumeSession.mock.calls.length).toBe(4)
+
+    // Once auto-retry gives up, the exhausted latch is armed for the routed
+    // session so the chat view can swap the perpetual loader for an explicit
+    // error + manual Retry instead of spinning forever.
+    expect($resumeExhaustedSessionId.get()).toBe('session-1')
+  })
+
+  it('does not arm the exhausted latch while retries remain', () => {
+    vi.useFakeTimers()
+    const resumeSession = vi.fn(async () => undefined)
+    const props = strandedProps(resumeSession)
+
+    const { rerender } = render(<RouteResumeHarness {...props} resumeFailedSessionId="session-1" />)
+    resumeSession.mockClear()
+
+    // Two failure cycles — still under the 4-retry cap, so the latch must stay
+    // clear and the loader keeps spinning (auto-recovery hasn't given up yet).
+    for (let i = 0; i < 2; i += 1) {
+      vi.advanceTimersByTime(8_000)
+      rerender(<RouteResumeHarness {...props} resumeFailedSessionId={null} />)
+      rerender(<RouteResumeHarness {...props} resumeFailedSessionId="session-1" />)
+    }
+
+    expect($resumeExhaustedSessionId.get()).toBeNull()
+  })
+
+  it('clears a stale exhausted latch when the route moves off the stranded session', () => {
+    vi.useFakeTimers()
+    const resumeSession = vi.fn(async () => undefined)
+    const props = strandedProps(resumeSession)
+
+    // Pre-arm the latch as if this session had exhausted its retries.
+    setResumeExhaustedSessionId('session-1')
+
+    // Route is now on a different, healthy session that is not flagged as
+    // failed — the retry effect's "route moved off" branch clears the latch.
+    render(
+      <RouteResumeHarness
+        {...props}
+        activeSessionId="runtime-2"
+        activeSessionIdRef={{ current: 'runtime-2' }}
+        locationPathname="/session-2"
+        resumeFailedSessionId={null}
+        routedSessionId="session-2"
+        selectedStoredSessionId="session-2"
+        selectedStoredSessionIdRef={{ current: 'session-2' }}
+      />
+    )
+
+    expect($resumeExhaustedSessionId.get()).toBeNull()
   })
 })

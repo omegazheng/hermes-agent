@@ -38,6 +38,7 @@ import {
   setFreshDraftReady,
   setIntroSeed,
   setMessages,
+  setResumeExhaustedSessionId,
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
   setSessions,
@@ -585,6 +586,10 @@ export function useSessionActions({
       // must not keep treating it as stranded. It's re-armed below only if THIS
       // attempt fails terminally (RPC reject + REST fallback failure).
       setResumeFailedSessionId(current => (current === storedSessionId ? null : current))
+      // Also clear the exhausted-latch: a fresh attempt (manual Retry, reconnect,
+      // reselect) gives the bounded auto-retry counter a clean cycle, so the
+      // chat view drops the error state and shows the loader again.
+      setResumeExhaustedSessionId(current => (current === storedSessionId ? null : current))
 
       const warmRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
 
@@ -704,6 +709,7 @@ export function useSessionActions({
           ...(watchWindow ? { lazy: true } : {}),
           ...(sessionProfile ? { profile: sessionProfile } : {})
         })
+
         // The rejection is consumed by the `await` below; this guard only
         // keeps it from surfacing as unhandled while the prefetch settles.
         resumePromise.catch(() => undefined)
