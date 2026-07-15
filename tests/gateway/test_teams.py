@@ -750,6 +750,150 @@ class TestTeamsMessageHandling:
         assert adapter.handle_message.await_count == 1
 
 
+class TestTeamsQuotedMessageHandling:
+    """Verify that Teams <quoted messageId="..."/> markers are extracted
+    and surface as reply_to_text / reply_to_message_id on the event."""
+
+    def _make_adapter(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+        ))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        adapter.handle_message = AsyncMock()
+        return adapter
+
+    def _make_ctx(self, text, reply_to_id=None, from_id="user-123"):
+        """Minimal activity for quoted-message tests."""
+        activity = MagicMock()
+        activity.text = text
+        activity.id = "activity-quote-001"
+        activity.from_ = MagicMock()
+        activity.from_.id = from_id
+        activity.from_.aad_object_id = "aad-456"
+        activity.from_.name = "Test User"
+        activity.conversation = MagicMock()
+        activity.conversation.id = "19:abc@thread.v2"
+        activity.conversation.conversation_type = "personal"
+        activity.conversation.name = "Test Chat"
+        activity.conversation.tenant_id = "tenant-789"
+        activity.attachments = []
+        # Bot Framework native replyToId — explicit None blocks MagicMock auto-creation
+        activity.reply_to_id = reply_to_id
+        activity.replyToId = reply_to_id
+        ctx = MagicMock()
+        ctx.activity = activity
+        ctx.conversation_ref = MagicMock()
+        return ctx
+
+    @pytest.mark.anyio
+    async def test_self_closing_quoted_tag_extracted(self):
+        """<quoted messageId="123"/> — text stripped, reply_id set, no reply_text."""
+        adapter = self._make_adapter()
+        ctx = self._make_ctx('<quoted messageId="1783832412020"/> Is this ready to ship?')
+        await adapter._on_message(ctx)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text == "Is this ready to ship?"
+        assert event.reply_to_message_id == "1783832412020"
+        assert event.reply_to_text is None
+        assert event.reply_to_is_own_message is False, (
+            "bot-id prefix shouldn't match a user's quoted message ID"
+        )
+
+    @pytest.mark.anyio
+    async def test_non_empty_quoted_tag_with_body_text(self):
+        """<quoted messageId="abc">some content</quoted> includes inline text."""
+        adapter = self._make_adapter()
+        ctx = self._make_ctx(
+            '<quoted messageId="msg-999">we should fix the login bug</quoted> +1'
+        )
+        await adapter._on_message(ctx)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.reply_to_message_id == "msg-999"
+        assert event.reply_to_text == "we should fix the login bug"
+        assert event.text == "+1"
+
+    @pytest.mark.anyio
+    async def test_only_quoted_tag_empty_message(self):
+        """Entire message is just the quoted marker — text empty."""
+        adapter = self._make_adapter()
+        ctx = self._make_ctx('<quoted messageId="12345"/>')
+        await adapter._on_message(ctx)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text == ""
+        assert event.reply_to_message_id == "12345"
+        assert event.reply_to_text is None
+
+    @pytest.mark.anyio
+    async def test_normal_message_no_quoted_tags(self):
+        """Message without quoted tags passes through unchanged."""
+        adapter = self._make_adapter()
+        ctx = self._make_ctx("Hello, can you review PR #42?")
+        await adapter._on_message(ctx)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text == "Hello, can you review PR #42?"
+        assert event.reply_to_message_id is None
+        assert event.reply_to_text is None
+
+    @pytest.mark.anyio
+    async def test_reply_to_id_from_bot_framework(self):
+        """activity.reply_to_id is used when no <quoted> tags present."""
+        adapter = self._make_adapter()
+        ctx = self._make_ctx("Looks good!", reply_to_id="msg-bot-001")
+        await adapter._on_message(ctx)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text == "Looks good!"
+        assert event.reply_to_message_id == "msg-bot-001"
+        assert event.reply_to_text is None
+
+    @pytest.mark.anyio
+    async def test_quoted_tag_wins_over_reply_to_id(self):
+        """When both <quoted> and replyToId present, <quoted> takes priority."""
+        adapter = self._make_adapter()
+        ctx = self._make_ctx(
+            '<quoted messageId="quoted-456"/> LGTM',
+            reply_to_id="reply-to-999",
+        )
+        await adapter._on_message(ctx)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.reply_to_message_id == "quoted-456", (
+            "<quoted> tag should win over raw replyToId"
+        )
+
+    @pytest.mark.anyio
+    async def test_quoted_marker_with_mention_stripped(self):
+        """@mention + quoted tag: both stripped correctly."""
+        adapter = self._make_adapter()
+        ctx = self._make_ctx(
+            '<at>Hermes</at> <quoted messageId="ref-1"/> please check'
+        )
+        await adapter._on_message(ctx)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text == "please check"
+        assert event.reply_to_message_id == "ref-1"
+
+    @pytest.mark.anyio
+    async def test_reply_to_own_message_detected(self):
+        """When reply_to_id starts with bot-id, flag as own message."""
+        adapter = self._make_adapter()
+        ctx = self._make_ctx(
+            '<quoted messageId="bot-id-msg-42"/> what do you mean?'
+        )
+        await adapter._on_message(ctx)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.reply_to_message_id == "bot-id-msg-42"
+        assert event.reply_to_is_own_message is True
+
+
 class TestTeamsAttachmentClassification:
     """Document attachments must set MessageType.DOCUMENT so run.py's
     document-context injection surfaces the cached file to the agent

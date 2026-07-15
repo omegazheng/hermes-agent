@@ -473,6 +473,51 @@ _ALLOWED_TEAMS_SERVICE_HOSTS = frozenset({
 import re as _re_teams
 _TEAMS_CONV_ID_RE = _re_teams.compile(r"^[A-Za-z0-9:@\-_.]+$")
 
+# Teams inserts <quoted messageId="..."/> XML markers when a user quotes/replies
+# to a message but doesn't echo the full content. Also matches any inline text
+# that follows the marker (e.g. "<quoted messageId="id123"> some text").
+_TEAMS_QUOTED_RE = _re_teams.compile(
+    r'<quoted\s+messageId="([^"]*)"(?:\s+[^>]*)?>(.*?)</quoted>'
+    r'|<quoted\s+messageId="([^"]*)"(?:\s+[^>]*)?/>'
+)
+
+
+def _extract_teams_quoted(text: str) -> tuple[str, list[str], str | None]:
+    """Extract quoted-message markers from Teams message text.
+
+    Teams sometimes sends ``<quoted messageId="1783832412020"/>`` with no
+    actual content — just a reference ID. Other times it wraps content:
+    ``<quoted messageId="...">some text</quoted>``. This helper returns:
+
+    Returns:
+        (cleaned_text, quote_ids, quote_text_or_None)
+    """
+    quote_ids: list[str] = []
+    # Collect any inline body text from non-empty quoted elements
+    gathered: list[str] = []
+    cleaned = text
+
+    for match in _TEAMS_QUOTED_RE.finditer(text):
+        # Group 1/2 = non-empty tag, group 3 = self-closing tag
+        msg_id = match.group(1) or match.group(3)
+        body = match.group(2)
+        if msg_id:
+            quote_ids.append(msg_id)
+        if body and body.strip():
+            gathered.append(body.strip())
+        # Remove the tag from the text
+        cleaned = cleaned.replace(match.group(0), "", 1)
+
+    quote_text = "\n".join(gathered) if gathered else None
+
+    # Clean up whitespace from tag removal
+    cleaned = cleaned.strip()
+    # If the whole message was just a quoted marker, return empty text
+    if not cleaned:
+        cleaned = ""
+
+    return cleaned, quote_ids, quote_text
+
 
 def _validate_teams_service_url(raw: str) -> Optional[str]:
     """Return a normalized service URL or ``None`` if it is not allowed.
@@ -860,6 +905,48 @@ class TeamsAdapter(BasePlatformAdapter):
             import re
             text = re.sub(r"<at>[^<]*</at>\s*", "", text).strip()
 
+        # --- quoted/reply message handling ---
+        # Teams sends <quoted messageId="..."/> XML markers when users quote
+        # messages. Sometimes the tag carries inline body text, but often it's
+        # just a self-closing reference with no content. We also check the
+        # Bot Framework's native replyToId for anchored replies.
+        reply_to_message_id: Optional[str] = None
+        reply_to_text: Optional[str] = None
+        reply_to_is_own = False
+
+        # 1. Parse <quoted> XML tags from the message text
+        if "<quoted" in text.lower():
+            text, quote_ids, quote_body = _extract_teams_quoted(text)
+            if quote_ids:
+                reply_to_message_id = quote_ids[-1]  # last quoted ref is most relevant
+            if quote_body:
+                reply_to_text = quote_body
+            # If the message is only a quoted marker (text is now empty),
+            # leave text empty so the agent can ask the user to clarify.
+
+        # 2. Check Bot Framework native replyToId (anchored reply)
+        raw_reply_to = getattr(activity, "reply_to_id", None) or getattr(
+            activity, "replyToId", None
+        )
+        if raw_reply_to and not reply_to_message_id:
+            reply_to_message_id = str(raw_reply_to)
+
+        # 3. Check if the replied-to message was from the bot itself
+        if reply_to_message_id:
+            bot_id = self._app.id if self._app else None
+            # If we have a cached message ID from our own sends, compare
+            if bot_id:
+                reply_to_is_own = str(reply_to_message_id).startswith(str(bot_id))
+
+        # 4. If we have a reply ID but no text, we note it for the agent
+        # but don't fabricate text — the agent can ask the user to paste.
+        if reply_to_message_id and not reply_to_text:
+            logger.debug(
+                "[teams] Quoted message %s received without text content — "
+                "agent will receive only the reference ID",
+                reply_to_message_id,
+            )
+
         # Determine chat type from conversation
         conv = activity.conversation
         conv_type = getattr(conv, "conversation_type", None) or ""
@@ -981,6 +1068,9 @@ class TeamsAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
             message_id=msg_id,
+            reply_to_message_id=reply_to_message_id,
+            reply_to_text=reply_to_text,
+            reply_to_is_own_message=reply_to_is_own,
         )
         await self.handle_message(event)
 
