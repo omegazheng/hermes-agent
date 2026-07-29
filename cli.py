@@ -2062,6 +2062,15 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     branch = info["branch"]
     repo_root = info["repo_root"]
 
+    # If the process cwd was moved into the worktree at launch (see the -w
+    # path), move out before removing it. Otherwise the directory is busy as
+    # our own cwd and `git worktree remove` can fail, leaving a leftover.
+    try:
+        if Path(os.getcwd()).resolve() == Path(wt_path).resolve():
+            os.chdir(repo_root)
+    except (OSError, ValueError):
+        os.chdir(repo_root)
+
     if not Path(wt_path).exists():
         return
 
@@ -17552,6 +17561,11 @@ def main(
             if wt_info:
                 _active_worktree = wt_info
                 os.environ["TERMINAL_CWD"] = wt_info["path"]
+                # Move the process into the worktree so its real OS cwd matches
+                # Hermes's logical cwd (TERMINAL_CWD). Without this the process
+                # stays in the launch dir and the terminal can't follow the
+                # worktree switch (e.g. Warp's vertical-tab pane metadata).
+                os.chdir(wt_info["path"])
                 atexit.register(_cleanup_worktree, wt_info)
             else:
                 # Worktree was explicitly requested but setup failed —

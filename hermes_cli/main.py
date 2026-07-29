@@ -2301,6 +2301,10 @@ def _launch_tui(
             sys.exit(1)
         env["HERMES_CWD"] = wt_info["path"]
         env["TERMINAL_CWD"] = wt_info["path"]
+        # Move the parent process into the worktree so its real OS cwd matches
+        # the worktree. (The Node TUI child still launches from its own ui-tui
+        # dir via the explicit cwd below.) Lets the terminal follow the worktree.
+        os.chdir(wt_info["path"])
 
     _apply_tui_python_env(env)
 
