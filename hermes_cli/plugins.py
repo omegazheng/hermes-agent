@@ -1208,6 +1208,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # so a stuck policy hook cannot spawn a new abandoned thread on every fire.
         self._hook_running_callbacks: dict[tuple, object] = {}
         self._hook_abandoned: dict[tuple, set] = {}
+        self._hook_abandoned_since: dict[tuple, float] = {}
         self._hook_timeout_suppressed_until: dict[tuple, float] = {}
         self._hook_timeout_lock = threading.Lock()
         self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS

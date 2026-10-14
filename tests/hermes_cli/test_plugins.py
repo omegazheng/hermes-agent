@@ -1456,6 +1456,51 @@ class TestForceReloadSymmetry:
 
         assert len(starts) == dispatch._HOOK_MAX_ABANDONED_WORKERS
         assert "blocker" in caplog.text and "abandoned worker(s) still running" in caplog.text
+
+    def test_abandoned_entries_expire_after_ttl(self, monkeypatch):
+        """Workers that NEVER finish must not wedge the callback forever (#514): entries in the
+        abandoned set older than _HOOK_ABANDONED_ENTRY_TTL_SECONDS expire, so a later call starts
+        a fresh worker even though the hung ones are still alive (bounded thread leak accepted)."""
+        import time
+
+        import hermes_cli.plugins_dispatch as dispatch
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+        hold = threading.Event()
+
+        def blocker(**_kwargs):
+            hold.wait(timeout=10.0)  # every worker hangs for good
+
+        mgr = PluginManager()
+        mgr._hook_timeout_suppression_seconds = 0.0  # isolate the TTL path from suppression
+        mgr._hooks["pre_tool_call"] = [blocker]
+
+        from hermes_cli.plugins import _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+        blocked = [{"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}]
+
+        # Fill the cap: every call abandons a worker.
+        for i in range(dispatch._HOOK_MAX_ABANDONED_WORKERS):
+            assert mgr.invoke_hook("pre_tool_call", tool_name="read_file",
+                                   tool_call_id=f"call-{i}") == blocked
+        key = ("pre_tool_call", id(blocker))
+        assert len(mgr._hook_abandoned[key]) == dispatch._HOOK_MAX_ABANDONED_WORKERS
+
+        # At the cap: skipped.
+        assert mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-x") == blocked
+
+        # Age every abandoned entry past the TTL without waiting: rewind the timestamps.
+        now = time.monotonic()
+        for k in list(mgr._hook_abandoned_since):
+            mgr._hook_abandoned_since[k] = now - (dispatch._HOOK_ABANDONED_ENTRY_TTL_SECONDS + 1)
+
+        # The next call expires the stale entries and starts a fresh worker (which also hangs
+        # and is abandoned again) — but crucially it RAN (fail-closed block came from a timeout,
+        # not from the cap-skip): exactly one new worker started.
+        assert mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-y") == blocked
+        assert len(mgr._hook_abandoned[key]) == 1  # only the new worker's entry remains
+        hold.set()
         hold.set()
 
     def test_hung_worker_does_not_fail_closed_forever(self, monkeypatch):

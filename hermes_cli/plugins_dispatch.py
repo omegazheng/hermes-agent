@@ -55,6 +55,11 @@ _HOOK_CALLER_THREAD_HOOKS: set[str] = {"subagent_stop"}
 _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 # Live workers a hung callback may accumulate before it is skipped outright (#105223 / #98382).
 _HOOK_MAX_ABANDONED_WORKERS = 3
+# Abandoned entries older than this are expired even though their workers may still be alive:
+# a worker that never finishes (unkillable child, deadlocked pipe drain) must not hold the
+# callback skipped forever — the session-wedge cost (#514 / #138644) outweighs one leaked
+# daemon thread. Chosen well above any sane hook timeout (10x the 30s default callback cap).
+_HOOK_ABANDONED_ENTRY_TTL_SECONDS = 300.0
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
 
 
@@ -336,6 +341,19 @@ class PluginDispatchMixin:
             # thread per call (#98382). At the cap the callback keeps being skipped (fail-closed
             # for pre_tool_call) until one of its workers finishes and releases its slot.
             abandoned = self._hook_abandoned.get(suppression_key)
+            if abandoned:
+                # Expire entries whose workers have been abandoned longer than the TTL: the
+                # thread may still be leaking, but skipping every later tool call until it
+                # finishes (possibly never) wedges the session (#514). At least one fresh
+                # attempt is allowed per TTL window; the cap still bounds live workers.
+                now = time.monotonic()
+                expired = [k for k in abandoned
+                           if now - self._hook_abandoned_since.get(k, now) >= _HOOK_ABANDONED_ENTRY_TTL_SECONDS]
+                for k in expired:
+                    abandoned.discard(k)
+                    self._hook_abandoned_since.pop(k, None)
+                if not abandoned:
+                    self._hook_abandoned.pop(suppression_key, None)
             if abandoned and len(abandoned) >= _HOOK_MAX_ABANDONED_WORKERS:
                 logger.warning(
                     "Hook '%s' callback %s (%s) skipped: %d abandoned worker(s) still running — "
@@ -358,6 +376,7 @@ class PluginDispatchMixin:
                     abandoned = self._hook_abandoned.get(suppression_key)
                     if abandoned is not None:
                         abandoned.discard(gate_key)
+                        self._hook_abandoned_since.pop(gate_key, None)
                         if not abandoned:
                             self._hook_abandoned.pop(suppression_key, None)
 
@@ -389,6 +408,7 @@ class PluginDispatchMixin:
                 # callback for that call id until reload with no thread behind it.
                 if self._hook_running_callbacks.get(gate_key) is token:
                     self._hook_abandoned.setdefault(suppression_key, set()).add(gate_key)
+                    self._hook_abandoned_since.setdefault(gate_key, time.monotonic())
             logger.warning(
                 "Hook '%s' callback %s timed out after %gs — skipping", hook_name, callback_name, timeout)
             return _HOOK_SKIPPED
